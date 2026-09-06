@@ -570,7 +570,7 @@ func TestE2E_TwoNodeDownloadFlow(t *testing.T) {
 	}
 	defer seedGate.Close()
 
-	seedSrv := NewServer(nil, seedGate, seedKey, false, 1)
+	seedSrv := NewServer(nil, seedGate, nil, seedKey, false, 1)
 	defer seedSrv.Stop()
 
 	seedStore := newE2EStorage(4096)
@@ -611,7 +611,7 @@ func TestE2E_TwoNodeDownloadFlow(t *testing.T) {
 	}
 	defer downGate.Close()
 
-	downSrv := NewServer(nil, downGate, downKey, false, 1)
+	downSrv := NewServer(nil, downGate, nil, downKey, false, 1)
 	defer downSrv.Stop()
 
 	downStore := newE2EStorage(4096)

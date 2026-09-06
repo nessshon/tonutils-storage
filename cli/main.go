@@ -330,7 +330,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	srv := storage.NewServer(dhtClient, gate, cfg.Key, serverMode, *DHTParallelism)
+	// Downloads use a throwaway per-bag identity so a seeder can not throttle our stable id.
+	newDLGate := func() (*adnl.Gateway, error) {
+		_, dlKey, keyErr := ed25519.GenerateKey(nil)
+		if keyErr != nil {
+			return nil, keyErr
+		}
+		dlGate := adnl.NewGatewayWithNetManager(dlKey, netMgr)
+		if startErr := dlGate.StartClient(); startErr != nil {
+			return nil, startErr
+		}
+		return dlGate, nil
+	}
+
+	srv := storage.NewServer(dhtClient, gate, newDLGate, cfg.Key, serverMode, *DHTParallelism)
 	Connector = storage.NewConnector(srv)
 	if *LimitDownload > 0 {
 		Connector.SetDownloadLimit(uint64(*LimitDownload))

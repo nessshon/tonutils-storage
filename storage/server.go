@@ -30,6 +30,7 @@ type Server struct {
 	key            ed25519.PrivateKey
 	dht            DHT
 	gate           *adnl.Gateway
+	newDLGate      func() (*adnl.Gateway, error)
 	store          Storage
 	closeCtx       context.Context
 	serverMode     bool
@@ -40,6 +41,9 @@ type Server struct {
 
 	bootstrapped map[string]*PeerConnection
 	mx           sync.RWMutex
+
+	dlIdentities map[string]*dlIdentity
+	dlMx         sync.Mutex
 
 	dhtCache      map[string]*dhtCacheEntry
 	dhtCacheMx    sync.RWMutex
@@ -56,15 +60,23 @@ type dhtCacheEntry struct {
 	expireAt time.Time
 }
 
-func NewServer(dhtClient DHT, gate *adnl.Gateway, key ed25519.PrivateKey, serverMode bool, dhtParallelism int) *Server {
+// dlIdentity is a per-bag download identity: its own throwaway gate and peer pool.
+type dlIdentity struct {
+	gate *adnl.Gateway
+	pool map[string]*PeerConnection
+}
+
+func NewServer(dhtClient DHT, gate *adnl.Gateway, newDLGate func() (*adnl.Gateway, error), key ed25519.PrivateKey, serverMode bool, dhtParallelism int) *Server {
 	var rateLimit = rldp.NewTokenBucket(1<<20, "storage")
 
 	s := &Server{
 		key:            key,
 		dht:            dhtClient,
 		gate:           gate,
+		newDLGate:      newDLGate,
 		netCtrl:        rateLimit,
 		bootstrapped:   map[string]*PeerConnection{},
+		dlIdentities:   map[string]*dlIdentity{},
 		serverMode:     serverMode,
 		dhtParallelism: dhtParallelism,
 		startedAt:      time.Now(),
@@ -129,24 +141,20 @@ func (s *Server) GetPeerIfActive(id []byte) *PeerConnection {
 }
 
 func (s *Server) bootstrapPeer(client adnl.Peer) *PeerConnection {
+	return s.bootstrapPeerInto(client, s.bootstrapped)
+}
+
+func (s *Server) bootstrapPeerInto(client adnl.Peer, pool map[string]*PeerConnection) *PeerConnection {
 	s.mx.Lock()
 	defer s.mx.Unlock()
 
-	if rl := s.bootstrapped[hex.EncodeToString(client.GetID())]; rl != nil {
+	id := hex.EncodeToString(client.GetID())
+	if rl := pool[id]; rl != nil {
 		return rl
 	}
 
 	extADNL := overlay.CreateExtendedADNL(client)
-	extADNL.SetOnUnknownOverlayQuery(s.handleQuery(extADNL))
-
 	rl := overlay.CreateExtendedRLDP(rldp.NewClientV2(extADNL))
-	rl.SetOnUnknownOverlayQuery(s.handleRLDPQuery(rl))
-
-	rl.SetOnDisconnect(func() {
-		s.mx.Lock()
-		delete(s.bootstrapped, hex.EncodeToString(client.GetID()))
-		s.mx.Unlock()
-	})
 
 	p := &PeerConnection{
 		rldp:             rl,
@@ -159,9 +167,66 @@ func (s *Server) bootstrapPeer(client adnl.Peer) *PeerConnection {
 		bagsInitQueue:    make(chan struct{}, 8),
 	}
 	p.MaxInflightPieces.Store(DownloadInitialPeerInflight)
-	s.bootstrapped[hex.EncodeToString(client.GetID())] = p
+
+	extADNL.SetOnUnknownOverlayQuery(s.handleQuery(extADNL, p))
+	rl.SetOnUnknownOverlayQuery(s.handleRLDPQuery(rl, p))
+	rl.SetOnDisconnect(func() {
+		s.mx.Lock()
+		delete(pool, id)
+		s.mx.Unlock()
+	})
+
+	pool[id] = p
 
 	return p
+}
+
+// dlIdentityFor returns the bag's download identity, creating it on first use.
+func (s *Server) dlIdentityFor(bagID []byte) *dlIdentity {
+	if s.newDLGate == nil {
+		return nil
+	}
+
+	id := hex.EncodeToString(bagID)
+
+	s.dlMx.Lock()
+	if d := s.dlIdentities[id]; d != nil {
+		s.dlMx.Unlock()
+		return d
+	}
+	s.dlMx.Unlock()
+
+	gate, err := s.newDLGate()
+	if err != nil {
+		Logger("[STORAGE] FAILED TO CREATE DOWNLOAD IDENTITY FOR", id, err.Error())
+		return nil
+	}
+
+	s.dlMx.Lock()
+	if d := s.dlIdentities[id]; d != nil { // lost the mint race, keep the winner
+		s.dlMx.Unlock()
+		gate.Close()
+		return d
+	}
+	d := &dlIdentity{gate: gate, pool: map[string]*PeerConnection{}}
+	s.dlIdentities[id] = d
+	s.dlMx.Unlock()
+
+	return d
+}
+
+// reapDLIdentity closes and drops a bag's download identity.
+func (s *Server) reapDLIdentity(bagID []byte) {
+	id := hex.EncodeToString(bagID)
+
+	s.dlMx.Lock()
+	d := s.dlIdentities[id]
+	delete(s.dlIdentities, id)
+	s.dlMx.Unlock()
+
+	if d != nil {
+		d.gate.Close()
+	}
 }
 
 func answerADNLStorageError(peer *overlay.ADNLWrapper, queryID []byte, err error) error {
@@ -184,7 +249,7 @@ func answerRLDPStorageError(peer *overlay.RLDPWrapper, transfer []byte, query *r
 	return nil
 }
 
-func (s *Server) handleQuery(peer *overlay.ADNLWrapper) func(query *adnl.MessageQuery) error {
+func (s *Server) handleQuery(peer *overlay.ADNLWrapper, conn *PeerConnection) func(query *adnl.MessageQuery) error {
 	return func(query *adnl.MessageQuery) error {
 		req, over := overlay.UnwrapQuery(query.Data)
 
@@ -231,7 +296,7 @@ func (s *Server) handleQuery(peer *overlay.ADNLWrapper) func(query *adnl.Message
 				return err
 			}
 		case Ping:
-			p := s.GetPeerIfActive(peer.GetID())
+			p := conn
 			if p == nil {
 				return answerADNLStorageError(peer, query.ID, fmt.Errorf("peer disconnected"))
 			}
@@ -254,7 +319,7 @@ func (s *Server) handleQuery(peer *overlay.ADNLWrapper) func(query *adnl.Message
 	}
 }
 
-func (s *Server) handleRLDPQuery(peer *overlay.RLDPWrapper) func(transfer []byte, query *rldp.Query) error {
+func (s *Server) handleRLDPQuery(peer *overlay.RLDPWrapper, conn *PeerConnection) func(transfer []byte, query *rldp.Query) error {
 	return func(transfer []byte, query *rldp.Query) error {
 		req, over := overlay.UnwrapQuery(query.Data)
 
@@ -290,7 +355,7 @@ func (s *Server) handleRLDPQuery(peer *overlay.RLDPWrapper) func(transfer []byte
 			timeout = 20 * time.Second
 		}
 
-		p := s.GetPeerIfActive(adnlId)
+		p := conn
 		if p == nil {
 			return answerRLDPStorageError(peer, transfer, query, fmt.Errorf("peer disconnected"))
 		}
@@ -928,7 +993,18 @@ func (s *Server) checkAndUpdateBagDHT(ctx context.Context, torrent *Torrent, isS
 
 func (s *Server) Stop() {
 	s.closer()
-	return
+
+	s.dlMx.Lock()
+	gates := make([]*adnl.Gateway, 0, len(s.dlIdentities))
+	for _, d := range s.dlIdentities {
+		gates = append(gates, d.gate)
+	}
+	s.dlIdentities = map[string]*dlIdentity{}
+	s.dlMx.Unlock()
+
+	for _, g := range gates {
+		g.Close()
+	}
 }
 
 func (t *Torrent) addNode(node overlay.Node) {
@@ -999,7 +1075,17 @@ func (s *Server) ConnectToNode(ctx context.Context, t *Torrent, node *overlay.No
 		return fmt.Errorf("failed build adnl from node key: %w", err)
 	}
 
-	peer := s.GetPeerIfActive(adnlID)
+	// Incomplete bags dial from a per-bag download identity; completed bags use the main gate.
+	dialGate, dlPool := s.gate, s.bootstrapped
+	if !t.IsCompleted() {
+		if d := s.dlIdentityFor(t.BagID); d != nil {
+			dialGate, dlPool = d.gate, d.pool
+		}
+	}
+
+	s.mx.RLock()
+	peer := dlPool[hex.EncodeToString(adnlID)]
+	s.mx.RUnlock()
 	if peer == nil {
 		start := time.Now()
 		if addrs == nil {
@@ -1045,11 +1131,12 @@ func (s *Server) ConnectToNode(ctx context.Context, t *Torrent, node *overlay.No
 		}
 		Logger("[STORAGE] ADDR FOR NODE ", hex.EncodeToString(adnlID), "FOUND", addr, "PUBKEY", hex.EncodeToString(key.Key), "FOR", hex.EncodeToString(t.BagID), "ELAPSED", time.Since(start).Seconds())
 
-		ax, err := s.gate.RegisterClient(addr, key.Key)
+		ax, err := dialGate.RegisterClient(addr, key.Key)
 		if err != nil {
 			return fmt.Errorf("failed to connnect to node: %w", err)
 		}
-		peer = s.bootstrapPeer(ax)
+
+		peer = s.bootstrapPeerInto(ax, dlPool)
 	} else {
 		Logger("[STORAGE] HAS ALREADY ACTIVE PEER FOR NODE ", hex.EncodeToString(adnlID), "ADDR", peer.adnl.RemoteAddr(), "ADDING FOR", hex.EncodeToString(t.BagID))
 	}
@@ -1302,6 +1389,9 @@ func (s *Server) startPeerSearcher() {
 			}
 
 			completed := t.IsCompleted()
+			if completed {
+				s.reapDLIdentity(t.BagID)
+			}
 			if !upload && completed {
 				continue
 			}
