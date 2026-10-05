@@ -35,6 +35,10 @@ type sizedFileRef struct {
 func (f sizedFileRef) GetSize() uint64 { return f.size }
 
 func CreateTorrent(ctx context.Context, filesRootPath, dirName, description string, db Storage, connector NetConnector, files []FileRef, progressCallback func(done uint64, max uint64)) (*Torrent, error) {
+	return CreateTorrentWithPieceSize(ctx, filesRootPath, dirName, description, 0, db, connector, files, progressCallback)
+}
+
+func CreateTorrentWithPieceSize(ctx context.Context, filesRootPath, dirName, description string, pieceSize uint32, db Storage, connector NetConnector, files []FileRef, progressCallback func(done uint64, max uint64)) (*Torrent, error) {
 	if dirName == "/" {
 		dirName = ""
 	}
@@ -42,15 +46,23 @@ func CreateTorrent(ctx context.Context, filesRootPath, dirName, description stri
 	if err := validateFileName(dirName, false); err != nil {
 		return nil, err
 	}
+	// same limits as peers apply when they receive torrent info
+	if pieceSize != 0 && pieceSize < 4096 {
+		return nil, fmt.Errorf("too small piece size")
+	}
 	header := &TorrentHeader{
 		DirNameSize: uint32(len(dirName)),
 		DirName:     []byte(dirName),
 	}
 
-	return CreateTorrentWithInitialHeader(ctx, filesRootPath, description, header, db, connector, files, progressCallback, true)
+	return createTorrentWithInitialHeader(ctx, filesRootPath, description, header, pieceSize, db, connector, files, progressCallback, true)
 }
 
 func CreateTorrentWithInitialHeader(ctx context.Context, filesRootPath, description string, header *TorrentHeader, db Storage, connector NetConnector, files []FileRef, progressCallback func(done uint64, max uint64), verbose bool) (*Torrent, error) {
+	return createTorrentWithInitialHeader(ctx, filesRootPath, description, header, 0, db, connector, files, progressCallback, verbose)
+}
+
+func createTorrentWithInitialHeader(ctx context.Context, filesRootPath, description string, header *TorrentHeader, pieceSize uint32, db Storage, connector NetConnector, files []FileRef, progressCallback func(done uint64, max uint64), verbose bool) (*Torrent, error) {
 
 	torrent := NewTorrent(filesRootPath, db, connector)
 	torrent.Header = header
@@ -65,7 +77,9 @@ func CreateTorrentWithInitialHeader(ctx context.Context, filesRootPath, descript
 		return nil, fmt.Errorf("invalid torrent header: %w", err)
 	}
 
-	var pieceSize = db.GetForcedPieceSize()
+	if pieceSize == 0 {
+		pieceSize = db.GetForcedPieceSize()
+	}
 
 	if pieceSize == 0 {
 		switch {

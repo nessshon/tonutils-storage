@@ -210,6 +210,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		Path          string   `json:"path"`
 		Description   string   `json:"description"`
 		KeepOnlyPaths []string `json:"keep_only_paths"`
+		PieceSize     uint32   `json:"piece_size"`
 	}{}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response(w, http.StatusBadRequest, Error{err.Error()})
@@ -255,7 +256,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	it, err := storage.CreateTorrent(r.Context(), rootPath, dirName, req.Description, s.store, s.connector, files, nil)
+	it, err := storage.CreateTorrentWithPieceSize(r.Context(), rootPath, dirName, req.Description, req.PieceSize, s.store, s.connector, files, nil)
 	if err != nil {
 		pterm.Error.Println("Failed to create bag:", err.Error())
 		response(w, http.StatusInternalServerError, Error{err.Error()})

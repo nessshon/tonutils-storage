@@ -238,6 +238,57 @@ func TestCreateTorrentMarksFreshBagVerified(t *testing.T) {
 	}
 }
 
+func TestCreateTorrentWithPieceSize(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/payload.bin"
+	data := bytes.Repeat([]byte{7}, 64<<10)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("failed to create payload: %v", err)
+	}
+	files := []FileRef{e2eFileRef{path: path, name: "payload.bin", size: uint64(len(data))}}
+
+	create := func(forced, requested uint32) (*Torrent, error) {
+		return CreateTorrentWithPieceSize(context.Background(), dir, "", "piece size", requested, newE2EStorage(forced), nil, files, nil)
+	}
+
+	for _, tc := range []struct {
+		name              string
+		forced, requested uint32
+		want              uint32
+	}{
+		{"picked by size", 0, 0, 128 << 10},
+		{"forced", 8192, 0, 8192},
+		{"requested over forced", 8192, 16384, 16384},
+	} {
+		tor, err := create(tc.forced, tc.requested)
+		if err != nil {
+			t.Fatalf("%s: failed to create torrent: %v", tc.name, err)
+		}
+		if tor.Info.PieceSize != tc.want {
+			t.Fatalf("%s: piece size %d, want %d", tc.name, tor.Info.PieceSize, tc.want)
+		}
+	}
+
+	// the point of the option: a bag created with a non-default piece size can be rebuilt with the same id
+	orig, err := create(8192, 0)
+	if err != nil {
+		t.Fatalf("failed to create original torrent: %v", err)
+	}
+	rebuilt, err := create(0, 8192)
+	if err != nil {
+		t.Fatalf("failed to rebuild torrent: %v", err)
+	}
+	if !bytes.Equal(orig.BagID, rebuilt.BagID) {
+		t.Fatal("rebuilt bag id differs from the original")
+	}
+
+	for _, size := range []uint32{100, 16 << 20} {
+		if _, err = create(0, size); err == nil {
+			t.Fatalf("piece size %d should be rejected", size)
+		}
+	}
+}
+
 func testTree(depth int, hashesCount int, b *testing.B) {
 	hashes := createHashes(hashesCount)
 	var hash []byte
